@@ -33,13 +33,18 @@ class AskRequest(BaseModel):
     allowed_course_ids: List[int]
     context: Optional[dict] = None
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "message": "Alemni RAG Server is running"}
 
 @app.post("/ask")
 async def ask(req: AskRequest):
-    index, metadata, model = load_resources()
+    print(f"Received request: {req.question} for user {req.user_id}")
+    try:
+        index, metadata, model = load_resources()
+    except Exception as e:
+        print(f"Failed to load resources: {e}")
+        return {"answer": "Erreur serveur : ressources non disponibles.", "citations": []}
 
     # 1. Vector Search
     q_emb = model.encode([req.question])
