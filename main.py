@@ -6,34 +6,53 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 import os
+import time
+from contextlib import asynccontextmanager
 
-app = FastAPI()
-
-# Global resources loaded lazily
+# Global resources
 _resources = {"index": None, "metadata": None, "model": None}
 
 def load_resources():
-    if _resources["index"] is None:
-        print("Loading RAG resources...")
+    if _resources["model"] is None:
+        start_time = time.time()
+        print(">>> START: Loading RAG resources...")
         try:
+            # 1. Load FAISS (Fast)
             _resources["index"] = faiss.read_index("faiss.index")
+            print(f">>> Index loaded in {time.time() - start_time:.2f}s")
+            
+            # 2. Load Metadata (Fast)
             with open("metadata.json", "r", encoding="utf-8") as f:
                 _resources["metadata"] = json.load(f)
-            # This is the heavy part
+            print(f">>> Metadata loaded in {time.time() - start_time:.2f}s")
+            
+            # 3. Load Model (Slow - ~80MB)
+            print(">>> Loading SentenceTransformer (all-MiniLM-L6-v2)...")
             _resources["model"] = SentenceTransformer("all-MiniLM-L6-v2")
-            print("Resources loaded successfully.")
+            print(f">>> Resources READY in {time.time() - start_time:.2f}s total.")
         except Exception as e:
-            print(f"Error loading resources: {e}")
+            print(f">>> CRITICAL ERROR during resource load: {e}")
             raise e
     return _resources["index"], _resources["metadata"], _resources["model"]
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Pre-warm on startup
+    try:
+        load_resources()
+    except:
+        pass
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health():
-    return {"status": "ok", "message": "Alemni RAG Server is running"}
+    return {"status": "ok", "message": "Alemni RAG Server is running", "ready": _resources["model"] is not None}
 
 @app.post("/ask")
 async def ask(request: Request):
-    # Use raw request to avoid Pydantic 422 errors
+    req_start = time.time()
     try:
         req_data = await request.json()
     except:
@@ -43,33 +62,43 @@ async def ask(request: Request):
     user_id = req_data.get("user_id", 0)
     allowed_ids = req_data.get("allowed_course_ids", [])
     
-    print(f"Received request: {question} for user {user_id}")
+    print(f"\n--- New Request from User {user_id} ---")
+    print(f"Question: {question}")
     
     try:
         index, metadata, model = load_resources()
     except Exception as e:
-        print(f"Failed to load resources: {e}")
-        return {"answer": "Erreur serveur : ressources non disponibles.", "citations": []}
+        return {"answer": f"Erreur serveur (chargement) : {str(e)}", "citations": []}
 
     # 1. Vector Search
+    embed_start = time.time()
     q_emb = model.encode([str(question)])
     q_emb = np.array(q_emb).astype("float32")
+    print(f"Embedding completed in {time.time() - embed_start:.2f}s")
 
-    # Retrieve candidates
+    # 2. FAISS Search
+    search_start = time.time()
     distances, ids = index.search(q_emb, 30)
+    print(f"FAISS search completed in {time.time() - search_start:.2f}s")
 
     context_chunks = []
     citations = []
     seen_urls = set()
 
+    # Ensure allowed_ids is a list
+    if not isinstance(allowed_ids, list):
+        allowed_ids = []
+
+    # 3. Filtering
+    filter_start = time.time()
     for rank, idx in enumerate(ids[0]):
         if idx == -1 or idx >= len(metadata):
             continue
             
         item = metadata[idx]
+        # Check both doc_id and course_id for robustness
         cid = item.get("doc_id") or item.get("course_id")
 
-        # Filtering
         if allowed_ids and cid not in allowed_ids:
             continue
 
@@ -85,18 +114,21 @@ async def ask(request: Request):
                     "locator": item.get("chunk_id")
                 })
                 seen_urls.add(url)
+    print(f"Filtering completed in {time.time() - filter_start:.2f}s")
 
     if not context_chunks:
+        print("Result: No matching context found.")
         return {
             "answer": "Je n'ai pas trouvé d'information spécifique dans vos cours actuels.",
             "citations": []
         }
 
-    # Better summary answer
+    # Answer Construction
     answer = context_chunks[0]
-    if len(answer) > 500:
-        answer = answer[:500] + "..."
+    if len(answer) > 600:
+        answer = answer[:600] + "..."
     
+    print(f"Total processing time: {time.time() - req_start:.2f}s")
     return {
         "answer": answer,
         "citations": citations
