@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Any
 import json
 import numpy as np
 import faiss
@@ -28,10 +28,10 @@ def load_resources():
     return _resources["index"], _resources["metadata"], _resources["model"]
 
 class AskRequest(BaseModel):
-    question: str
-    user_id: int
-    allowed_course_ids: List[int]
-    context: Optional[dict] = None
+    question: Any
+    user_id: Any
+    allowed_course_ids: Any
+    context: Optional[Any] = None
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health():
@@ -47,7 +47,7 @@ async def ask(req: AskRequest):
         return {"answer": "Erreur serveur : ressources non disponibles.", "citations": []}
 
     # 1. Vector Search
-    q_emb = model.encode([req.question])
+    q_emb = model.encode([str(req.question)])
     q_emb = np.array(q_emb).astype("float32")
 
     # Retrieve candidates
@@ -57,15 +57,19 @@ async def ask(req: AskRequest):
     citations = []
     seen_urls = set()
 
+    # Ensure allowed_course_ids is a list for filtering
+    allowed_ids = req.allowed_course_ids
+    if not isinstance(allowed_ids, list):
+        allowed_ids = []
+
     for rank, idx in enumerate(ids[0]):
         if idx == -1 or idx >= len(metadata):
             continue
             
         item = metadata[idx]
-        # Compatibility with different metadata keys (doc_id or course_id)
         cid = item.get("doc_id") or item.get("course_id")
 
-        if cid is not None and cid not in req.allowed_course_ids:
+        if cid is not None and cid not in allowed_ids:
             continue
 
         if len(context_chunks) < 5:
